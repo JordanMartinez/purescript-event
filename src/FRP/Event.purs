@@ -18,6 +18,8 @@ import Data.Filterable (class Filterable, filterMap)
 import Data.Foldable (sequence_, traverse_)
 import Data.Maybe (Maybe(..), fromJust, isJust)
 import Effect (Effect)
+import Data.Tuple.Nested ((/\))
+import Effect.Class (class MonadEffect, liftEffect)
 import Effect.Ref as Ref
 import Effect.Unsafe (unsafePerformEffect)
 import FRP.Event.Class (class Filterable, class IsEvent, count, filterMap, fix,
@@ -37,19 +39,19 @@ import Unsafe.Reference (unsafeRefEq)
 -- | combined using the various functions and instances provided in this module.
 -- |
 -- | Events are consumed by providing a callback using the `subscribe` function.
-newtype Event a = Event ((a -> Effect Unit) -> Effect (Effect Unit))
+newtype Event m a = Event ((a -> m Unit) -> m (m Unit))
 
-instance functorEvent :: Functor Event where
+instance functorEvent :: Functor (Event m) where
   map f (Event e) = Event \k -> e (k <<< f)
 
-instance compactableEvent :: Compactable Event where
+instance compactableEvent :: MonadEffect m => Compactable (Event m) where
   compact xs = map (\x -> unsafePartial fromJust x) (filter isJust xs)
   separate xs =
     { left: unsafePartial (map fromLeft) (filter isLeft xs)
     , right: unsafePartial (map fromRight) (filter isRight xs)
     }
 
-instance filterableEvent :: Filterable Event where
+instance filterableEvent :: MonadEffect m => Filterable (Event m) where
   filter = filter
 
   filterMap f = map (\x -> unsafePartial fromJust x) <<< filter isJust <<< map f
@@ -61,98 +63,108 @@ instance filterableEvent :: Filterable Event where
     , right: filterMap (hush <<< f) xs
     }
 
-instance applyEvent :: Apply Event where
+instance applyEvent :: MonadEffect m => Apply (Event m) where
   apply (Event e1) (Event e2) = Event \k -> do
-    latestA <- Ref.new Nothing
-    latestB <- Ref.new Nothing
+    latestA /\ latestB <- liftEffect do
+      latestA <- Ref.new Nothing
+      latestB <- Ref.new Nothing
+      pure (latestA /\ latestB)
     c1 <- e1 \a -> do
-      Ref.write (Just a) latestA
-      Ref.read latestB >>= traverse_ (k <<< a)
+      b <- liftEffect do
+
+        Ref.write (Just a) latestA
+        Ref.read latestB
+      traverse_ (k <<< a) b
     c2 <- e2 \b -> do
-      Ref.write (Just b) latestB
-      Ref.read latestA >>= traverse_ (k <<< (_ $ b))
+      a <- liftEffect do
+        Ref.write (Just b) latestB
+        Ref.read latestA
+      traverse_ (k <<< (_ $ b)) a
     pure (c1 *> c2)
 
-instance applicativeEvent :: Applicative Event where
+instance applicativeEvent :: MonadEffect m => Applicative (Event m) where
   pure a = Event \k -> do
     k a
     pure (pure unit)
 
-instance altEvent :: Alt Event where
+instance altEvent :: Monad m => Alt (Event m) where
   alt (Event f) (Event g) = Event \k -> do
     c1 <- f k
     c2 <- g k
     pure (c1 *> c2)
 
-instance plusEvent :: Plus Event where
+instance plusEvent :: MonadEffect m => Plus (Event m) where
   empty = Event \_ -> pure (pure unit)
 
-instance alternativeEvent :: Alternative Event
+instance alternativeEvent :: MonadEffect m => Alternative (Event m)
 
-instance semigroupEvent :: Semigroup a => Semigroup (Event a) where
+instance semigroupEvent :: (MonadEffect m, Semigroup a) => Semigroup (Event m a) where
   append = lift2 append
 
-instance monoidEvent :: Monoid a => Monoid (Event a) where
+instance monoidEvent :: (MonadEffect m, Monoid a) => Monoid (Event m a) where
   mempty = pure mempty
 
-instance eventIsEvent :: Class.IsEvent Event where
+instance eventIsEvent :: MonadEffect m => Class.IsEvent (Event m) where
   fold = fold
   keepLatest = keepLatest
   sampleOn = sampleOn
   fix = fix
 
 -- | Fold over values received from some `Event`, creating a new `Event`.
-fold :: forall a b. (a -> b -> b) -> Event a -> b -> Event b
+fold :: forall m a b. MonadEffect m => (a -> b -> b) -> Event m a -> b -> Event m b
 fold f (Event e) b = Event \k -> do
-  result <- Ref.new b
-  e \a -> Ref.modify (f a) result >>= k
+  result <- liftEffect $ Ref.new b
+  e \a -> do
+    rez <- liftEffect $ Ref.modify (f a) result
+    k rez
 
 -- | Create an `Event` which only fires when a predicate holds.
-filter :: forall a. (a -> Boolean) -> Event a -> Event a
+filter :: forall m a. Applicative m => (a -> Boolean) -> Event m a -> Event m a
 filter p (Event e) = Event \k -> e \a -> if p a then k a else pure unit
 
 -- | Create an `Event` which samples the latest values from the first event
 -- | at the times when the second event fires.
-sampleOn :: forall a b. Event a -> Event (a -> b) -> Event b
+sampleOn :: forall m a b. MonadEffect m => Event m a -> Event m (a -> b) -> Event m b
 sampleOn (Event e1) (Event e2) = Event \k -> do
-  latest <- Ref.new Nothing
+  latest <- liftEffect $ Ref.new Nothing
   c1 <- e1 \a -> do
-    Ref.write (Just a) latest
+    liftEffect $ Ref.write (Just a) latest
   c2 <- e2 \f -> do
-    Ref.read latest >>= traverse_ (k <<< f)
+    latest0 <- liftEffect $ Ref.read latest
+    traverse_ (k <<< f) latest0
   pure (c1 *> c2)
 
 -- | Flatten a nested `Event`, reporting values only from the most recent
 -- | inner `Event`.
-keepLatest :: forall a. Event (Event a) -> Event a
+keepLatest :: forall m a. MonadEffect m => Event m (Event m a) -> Event m a
 keepLatest (Event e) = Event \k -> do
-  cancelInner <- Ref.new Nothing
+  cancelInner <- liftEffect $ Ref.new Nothing
   cancelOuter <- e \inner -> do
-    Ref.read cancelInner >>= sequence_
+    (liftEffect $ Ref.read cancelInner) >>= sequence_
     c <- subscribe inner k
-    Ref.write (Just c) cancelInner
+    liftEffect $ Ref.write (Just c) cancelInner
   pure do
-    Ref.read cancelInner >>= sequence_
+    (liftEffect $ Ref.read cancelInner) >>= sequence_
     cancelOuter
 
 -- | Compute a fixed point
-fix :: forall i o. (Event i -> { input :: Event i, output :: Event o }) -> Event o
+fix :: forall m i o. MonadEffect m => (Event m i -> { input :: Event m i, output :: Event m o }) -> Event m o
 fix f = Event \k -> do
+    { event, push } <- create
+    let { input, output } = f event
     c1 <- subscribe input push
     c2 <- subscribe output k
     pure (c1 *> c2)
-  where
-    { event, push } = unsafePerformEffect create
-    { input, output } = f event
 
 -- | Subscribe to an `Event` by providing a callback.
 -- |
 -- | `subscribe` returns a canceller function.
 subscribe
-  :: forall r a
-   . Event a
-  -> (a -> Effect r)
-  -> Effect (Effect Unit)
+  :: forall r m a
+   . MonadEffect m
+  => Event m a
+  -> (a -> m r)
+  -> m (m Unit)
 subscribe (Event e) k = e (void <<< k)
 
 -- | Make an `Event` from a function which accepts a callback and returns an
@@ -161,28 +173,29 @@ subscribe (Event e) k = e (void <<< k)
 -- | Note: you probably want to use `create` instead, unless you need explicit
 -- | control over unsubscription.
 makeEvent
-  :: forall a
-   . ((a -> Effect Unit) -> Effect (Effect Unit))
-  -> Event a
+  :: forall m a
+   . ((a -> m Unit) -> m (m Unit))
+  -> Event m a
 makeEvent = Event
 
-type EventIO a =
-  { event :: Event a
-  , push :: a -> Effect Unit
+type EventIO m a =
+  { event :: Event m a
+  , push :: a -> m Unit
   }
 
 -- | Create an event and a function which supplies a value to that event.
 create
-  :: forall a
-   . Effect (EventIO a)
+  :: forall m a
+   . MonadEffect m
+  => m (EventIO m a)
 create = do
-  subscribers <- Ref.new []
+  subscribers <- liftEffect $ Ref.new []
   pure
     { event: Event \k -> do
-        _ <- Ref.modify (_ <> [k]) subscribers
+        _ <- liftEffect $ Ref.modify (_ <> [k]) subscribers
         pure do
-          _ <- Ref.modify (deleteBy unsafeRefEq k) subscribers
+          _ <- liftEffect $ Ref.modify (deleteBy unsafeRefEq k) subscribers
           pure unit
     , push: \a -> do
-        Ref.read subscribers >>= traverse_ \k -> k a
+        (liftEffect $ Ref.read subscribers) >>= traverse_ \k -> k a
     }
